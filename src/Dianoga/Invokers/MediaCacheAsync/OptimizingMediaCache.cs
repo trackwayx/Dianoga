@@ -1,8 +1,10 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Reflection;
 using System.Threading;
 using Sitecore;
+using Sitecore.Data;
 using Sitecore.Diagnostics;
 using Sitecore.Resources.Media;
 using Sitecore.Sites;
@@ -17,6 +19,7 @@ namespace Dianoga.Invokers.MediaCacheAsync
 	public class OptimizingMediaCache : MediaCache
 	{
 		private readonly MediaOptimizer _optimizer;
+		private readonly ConcurrentDictionary<ID, int> _mediaCurrentlyOptimizingDictionary = new ConcurrentDictionary<ID, int>();
 
 		public OptimizingMediaCache(MediaOptimizer optimizer)
 		{
@@ -60,6 +63,8 @@ namespace Dianoga.Invokers.MediaCacheAsync
 
 			// we store the site context because on the background thread: without the Sitecore context saved (on a worker thread), that disables the media cache
 			var currentSite = Context.Site;
+
+			AddToMediaCurrentlyOptimizingDictionary(media);
 
 			ThreadPool.QueueUserWorkItem(state =>
 			{
@@ -106,6 +111,18 @@ namespace Dianoga.Invokers.MediaCacheAsync
 					// this runs in a background thread, and an exception here would cause IIS to terminate the app pool. Bad! So we catch/log, just in case.
 					Log.Error($"Dianoga: Exception occurred on the background thread when optimizing: {mediaPath}", ex, this);
 				}
+				finally
+				{
+					try
+					{
+						RemoveFromMediaCurrentlyOptimizingDictionary(media);
+					}
+					catch (Exception ex)
+					{
+						// this runs in a background thread, and an exception here would cause IIS to terminate the app pool. Bad! So we catch/log, just in case.
+						Log.Error($"Dianoga: Exception occurred on the background thread when optimizing: {mediaPath}", ex, this);
+					}
+				}
 			});
 
 			return true;
@@ -131,6 +148,44 @@ namespace Dianoga.Invokers.MediaCacheAsync
 			if (baseMethod != null)
 				baseMethod.Invoke(this, new object[] { record });
 			else Log.Error("Dianoga: Couldn't use malevolent private reflection on RemoveFromActiveList! This may mean Dianoga isn't entirely compatible with this version of Sitecore, though it should only affect a performance optimization.", this);
+		}
+
+		private void AddToMediaCurrentlyOptimizingDictionary(Media media)
+		{
+			var id = GetMediaId(media);
+			lock (_mediaCurrentlyOptimizingDictionary)
+			{
+				if (_mediaCurrentlyOptimizingDictionary.TryGetValue(id, out int num))
+					_mediaCurrentlyOptimizingDictionary[id] = num + 1;
+				else
+					_mediaCurrentlyOptimizingDictionary[id] = 1;
+			}
+		}
+
+		private void RemoveFromMediaCurrentlyOptimizingDictionary(Media media)
+		{
+			var id = GetMediaId(media);
+			lock (_mediaCurrentlyOptimizingDictionary)
+			{
+				if (_mediaCurrentlyOptimizingDictionary.TryGetValue(id, out int num))
+				{
+					if (num > 1)
+						_mediaCurrentlyOptimizingDictionary[id] = num - 1;
+					else
+						_mediaCurrentlyOptimizingDictionary.TryRemove(id, out _);
+				}
+			}
+		}
+
+		private static ID GetMediaId(Media media)
+		{
+			return media.MediaData.MediaItem.ID;
+		}
+
+		public bool IsCurrentlyOptimizing(Media media)
+		{
+			// ReSharper disable once InconsistentlySynchronizedField
+			return _mediaCurrentlyOptimizingDictionary.ContainsKey(GetMediaId(media));
 		}
 	}
 }
